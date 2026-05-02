@@ -1,0 +1,158 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# AWS CloudFront icin Outline Shadowsocks-over-WebSocket
+#
+# Mimari:
+#   Istemci → CloudFront anycast IP:443 (TLS, SNI=cloudfront.net vb.)
+#           → CloudFront (HTTP Host = Bu container'in adresi)
+#           → nginx:80 (HTTP WebSocket proxy, TLS yok — CloudFront halleder)
+#           → outline-ss-server:8080
+#
+# Build:
+#   docker build -f Dockerfile.cloudfront -t outline-cloudfront .
+#
+# Yerel test:
+#   docker run --rm \
+#     -e WS_PATH=$(openssl rand -hex 20) \
+#     -e SS_SECRET=$(openssl rand -base64 32) \
+#     -p 80:80 \
+#     outline-cloudfront
+#
+# AWS ECS / App Runner deploy:
+#   # ECR'ye gonder:
+#   aws ecr get-login-password | docker login --username AWS --password-stdin ACCOUNT.dkr.ecr.REGION.amazonaws.com
+#   docker tag outline-cloudfront ACCOUNT.dkr.ecr.REGION.amazonaws.com/outline-cloudfront
+#   docker push ACCOUNT.dkr.ecr.REGION.amazonaws.com/outline-cloudfront
+#
+#   # CloudFront Origin ayari:
+#   Origin Domain : <ECS/AppRunner endpoint>
+#   Origin Protocol: HTTP
+#   Origin Port   : 80
+#   WebSocket     : Enabled (Behavior → Cache Policy → CachingDisabled)
+#
+# ENV degiskenleri:
+#   WS_PATH     - WebSocket path (zorunlu, openssl rand -hex 20 ile uret)
+#   SS_SECRET   - Shadowsocks secret (zorunlu, openssl rand -base64 32 ile uret)
+#   ORIGIN_PORT - nginx dinleme portu (varsayilan: 80)
+# =============================================================================
+
+# ── Derleme asamasi ───────────────────────────────────────────────────────────
+FROM golang:1.24-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+RUN git clone --depth=1 \
+    https://github.com/OutlineFoundation/tunnel-server.git .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags='-s -w' \
+    -o /outline-ss-server ./cmd/outline-ss-server
+
+# ── Calisma asamasi ───────────────────────────────────────────────────────────
+FROM alpine:3.20
+
+# nginx — CloudFront'tan gelen HTTP:80'i WebSocket olarak outline-ss-server'a iletir
+RUN apk add --no-cache ca-certificates nginx
+
+COPY --from=builder /outline-ss-server /usr/local/bin/outline-ss-server
+
+# Baslatma scripti:
+#   1) ENV'den outline-ss-server config.yaml uretir
+#   2) ENV'den nginx.conf uretir
+#   3) outline-ss-server arkaplanda baslatir
+#   4) nginx on planda calisir (container ana islemi)
+COPY <<'ENTRYPOINT_EOF' /entrypoint.sh
+#!/bin/sh
+set -e
+
+: "${WS_PATH:?  HATA: WS_PATH env degiskeni zorunlu  (openssl rand -hex 20)}"
+: "${SS_SECRET:?HATA: SS_SECRET env degiskeni zorunlu (openssl rand -base64 32)}"
+
+ORIGIN_PORT="${ORIGIN_PORT:-80}"
+
+mkdir -p /etc/outline /run/nginx /var/log/nginx /var/lib/nginx/tmp
+
+# ── outline-ss-server config.yaml ─────────────────────────────────────────────
+cat > /etc/outline/config.yaml << CONFIG_EOF
+web:
+  servers:
+    - id: server1
+      listen:
+        - "127.0.0.1:8080"
+
+services:
+  - listeners:
+      - type: websocket-stream
+        web_server: server1
+        path: "/${WS_PATH}"
+    keys:
+      - id: 1
+        cipher: chacha20-ietf-poly1305
+        secret: ${SS_SECRET}
+CONFIG_EOF
+
+# ── nginx.conf ─────────────────────────────────────────────────────────────────
+# \$http_upgrade ve \$host nginx degiskenleridir — shell tarafindan yorumlanmamali
+cat > /etc/nginx/nginx.conf << NGINX_EOF
+user nginx;
+worker_processes auto;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log off;
+
+    server {
+        listen ${ORIGIN_PORT};
+        listen [::]:${ORIGIN_PORT};
+        server_name _;
+
+        # CloudFront'tan gelen WebSocket isteklerini outline-ss-server'a ilet
+        location = /${WS_PATH} {
+            proxy_pass         http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade    \$http_upgrade;
+            proxy_set_header   Connection "upgrade";
+            proxy_set_header   Host       \$host;
+            proxy_set_header   X-Real-IP  \$remote_addr;
+            proxy_read_timeout 86400;
+            proxy_buffering    off;
+            proxy_request_buffering off;
+        }
+
+        # Diger yollar — 404 don
+        location / {
+            return 404;
+        }
+    }
+}
+NGINX_EOF
+
+# outline-ss-server arkaplanda baslat
+echo "[outline] outline-ss-server baslatiliyor (port 8080, path: /${WS_PATH})..."
+/usr/local/bin/outline-ss-server -config=/etc/outline/config.yaml &
+SS_PID=$!
+
+# outline-ss-server kapanirsa nginx'i de kapat (container yeniden baslatilir)
+cleanup() {
+    echo "[outline] Kapatiliyor..."
+    kill "$SS_PID" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT
+
+# nginx on planda calis (container ana islemi)
+echo "[nginx] nginx baslatiliyor (port ${ORIGIN_PORT})..."
+exec nginx -g "daemon off;"
+ENTRYPOINT_EOF
+
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 80
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Google Cloud Run — HAProxy TCP Tunnel → VPS outline-ss-server
+#
+# Mimari:
+#   Istemci → Cloud Run anycast:443 (TLS, Google halleder)
+#           → Bu container:8080 (HAProxy, TCP mode — raw byte tunnel)
+#           → VPS outline-ss-server:80 (WebSocket, ss.sh ile kurulu)
+#
+# Build (degerler image icine gömülür, deploy/run sirasinda tekrar girmen gerekmez):
+#   docker build -f Dockerfile.cloudrun \
+#     --build-arg ORIGIN_HOST=2.59.132.27 \
+#     --build-arg ORIGIN_PORT=80 \
+#     -t outline-cloudrun-proxy .
+#
+# Yerel test:
+#   docker run --rm -p 8080:8080 outline-cloudrun-proxy
+#
+#   # WebSocket test (101 donmeli):
+#   curl -v --http1.1 http://localhost:8080/ \
+#     -H "Connection: Upgrade" -H "Upgrade: websocket" \
+#     -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+#     -H "Sec-WebSocket-Version: 13"
+#
+# Google Cloud Run deploy (ENV girmen gerekmiyor, image icinde):
+#   docker tag outline-cloudrun-proxy gcr.io/PROJE_ID/outline-cloudrun-proxy
+#   docker push gcr.io/PROJE_ID/outline-cloudrun-proxy
+#
+#   gcloud run deploy outline-proxy \
+#     --image gcr.io/PROJE_ID/outline-cloudrun-proxy \
+#     --allow-unauthenticated \
+#     --port 8080 \
+#     --min-instances 1 \
+#     --timeout 3600 \
+#     --region europe-west3
+#
+# Deploy sonrasi access.yaml (ss.sh ciktisindaki degerlerle):
+#   transport:
+#     $type: tcpudp
+#     tcp:
+#       $type: shadowsocks
+#       cipher: <SS_CIPHER>
+#       secret: <SS_SECRET>
+#       endpoint:
+#         $type: first-supported
+#         options:
+#           - $type: websocket
+#             url: wss://<CLOUD_RUN_URL>/
+#             endpoint: <CLOUD_RUN_ANYCAST_IP>:443
+#           - <CLOUD_RUN_ANYCAST_IP>:443
+#     udp:
+#       $type: shadowsocks
+#       cipher: <SS_CIPHER>
+#       secret: <SS_SECRET>
+#       endpoint:
+#         $type: first-supported
+#         options:
+#           - $type: websocket
+#             url: wss://<CLOUD_RUN_URL>/u
+#             endpoint: <CLOUD_RUN_ANYCAST_IP>:443
+#           - <CLOUD_RUN_ANYCAST_IP>:443
+#
+# BUILD ARG degiskenleri (docker build --build-arg ile verilir, image icine islenir):
+#   ORIGIN_HOST - VPS IP adresi (zorunlu, ss.sh kurdugun sunucu)
+#   ORIGIN_PORT - VPS outline-ss-server portu (varsayilan: 80)
+# =============================================================================
+
+FROM haproxy:alpine
+
+# Build zamani argumanlari — docker build --build-arg ile saglanir
+ARG ORIGIN_HOST
+ARG ORIGIN_PORT=80
+
+# Deger kontrolu: ORIGIN_HOST verilmemisse build hata verir
+RUN test -n "${ORIGIN_HOST}" || { echo "HATA: --build-arg ORIGIN_HOST=<VPS_IP> gerekli"; exit 1; }
+
+# Argumanlari runtime ENV olarak image'a gom
+ENV ORIGIN_HOST=${ORIGIN_HOST}
+ENV ORIGIN_PORT=${ORIGIN_PORT}
+
+COPY <<'ENTRYPOINT_EOF' /entrypoint.sh
+#!/bin/sh
+set -e
+
+LISTEN_PORT="${PORT:-8080}"
+
+cat > /usr/local/etc/haproxy/haproxy.cfg << HAPROXY_EOF
+global
+    maxconn 65536
+    log stdout format raw local0 info
+
+defaults
+    mode    tcp
+    log     global
+    option  tcplog
+    option  dontlognull
+    timeout connect  5s
+    timeout client   3600s
+    timeout server   3600s
+
+frontend ws_front
+    bind *:${LISTEN_PORT}
+    default_backend vps_back
+
+backend vps_back
+    server vps ${ORIGIN_HOST}:${ORIGIN_PORT} check inter 10s
+HAPROXY_EOF
+
+echo "[proxy] Basladi"
+echo "[proxy]   Dinliyor : 0.0.0.0:${LISTEN_PORT}"
+echo "[proxy]   Hedef    : ${ORIGIN_HOST}:${ORIGIN_PORT}"
+exec haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+ENTRYPOINT_EOF
+
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh"]
